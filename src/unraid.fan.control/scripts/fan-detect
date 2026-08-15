@@ -1,0 +1,125 @@
+#!/bin/bash
+#=======================================================================================
+#  fan-detect - hardware discovery and fan characterisation helper
+#
+#  The two things you cannot guess about a machine's fans are which PWM channel
+#  drives which physical fan, and how slowly each fan can turn before it stalls.
+#  Both have to be measured. This does that.
+#
+#    fan-detect                 list hwmon controllers, channels and current state
+#    fan-detect --map           spin each channel in turn to find which fan it drives
+#    fan-detect --sweep N       ramp channel N down to find its stall floor
+#    fan-detect --restore       hand every channel back to the chip's auto mode
+#
+#  Safe by construction: --map and --sweep raise or briefly lower one fan at a
+#  time and always restore the previous value, and nothing here disables a fan.
+#  Still, do not run --sweep while the array is under heavy load.
+#=======================================================================================
+set -u
+
+find_hwmons() {
+  local h
+  for h in /sys/class/hwmon/hwmon*; do
+    compgen -G "$h/pwm[0-9]" >/dev/null 2>&1 && echo "$h"
+  done
+}
+
+list() {
+  local found=0 h n p c rpm en
+  for h in $(find_hwmons); do
+    found=1
+    n=$(cat "$h/name" 2>/dev/null)
+    echo "== $h  ($n)"
+    for p in "$h"/pwm[0-9]; do
+      c=${p##*/pwm}
+      rpm=$(cat "$h/fan${c}_input" 2>/dev/null || echo "-")
+      en=$(cat "${p}_enable" 2>/dev/null || echo "-")
+      printf "   pwm%-2s  value=%-4s enable=%-2s  fan%s=%s rpm%s\n" \
+        "$c" "$(cat "$p" 2>/dev/null)" "$en" "$c" "$rpm" \
+        "$([ "$rpm" = "0" ] && echo "   <- 0 rpm: no fan, or stalled at this duty")"
+    done
+  done
+  if (( found == 0 )); then
+    echo "No hwmon device with writable pwm nodes found."
+    echo
+    echo "Install a super-I/O driver for your board:"
+    echo "  ITE (IT86xx/IT87xx)  -> 'it87-driver' plugin from Community Applications"
+    echo "  Nuvoton (NCT67xx)    -> modprobe nct6775"
+    echo
+    echo "Note that 0 rpm does NOT always mean 'no fan connected'. A fan being"
+    echo "driven below its stall threshold also reads 0. Use --sweep to tell them"
+    echo "apart: if the channel produces rpm at a higher duty, there is a fan on it."
+    return 1
+  fi
+}
+
+hw_of() { # channel -> hwmon path
+  local h
+  for h in $(find_hwmons); do [[ -w $h/pwm$1 ]] && { echo "$h"; return 0; }; done
+  return 1
+}
+
+map() {
+  local h p c old
+  for h in $(find_hwmons); do
+    echo "== $h ($(cat "$h/name" 2>/dev/null))"
+    for p in "$h"/pwm[0-9]; do
+      [[ -w $p ]] || continue
+      c=${p##*/pwm}
+      old=$(cat "$p"); oldn=$(cat "${p}_enable" 2>/dev/null)
+      echo 1 > "${p}_enable" 2>/dev/null
+      echo "   -> pwm$c to FULL for 6s, watch/listen for which fan speeds up"
+      echo 255 > "$p"; sleep 6
+      printf "      fan%s reads %s rpm\n" "$c" "$(cat "$h/fan${c}_input" 2>/dev/null || echo -)"
+      echo "$old" > "$p"
+      [[ -n ${oldn:-} ]] && echo "$oldn" > "${p}_enable" 2>/dev/null
+      sleep 4
+    done
+  done
+  echo "done - previous values restored"
+}
+
+sweep() {
+  local c=$1 h p old oldn rpm stall=""
+  h=$(hw_of "$c") || { echo "no writable pwm$c found"; return 1; }
+  p="$h/pwm$c"
+  old=$(cat "$p"); oldn=$(cat "${p}_enable" 2>/dev/null)
+  echo "Sweeping pwm$c on $(cat "$h/name"). Restores to $old when done."
+  echo
+  printf "  %-6s %-6s %s\n" PWM PCT RPM
+  echo 1 > "${p}_enable" 2>/dev/null
+  for v in 255 200 160 128 100 80 64 51 40 35 30 25 20 15 10; do
+    echo "$v" > "$p"; sleep 7
+    rpm=$(cat "$h/fan${c}_input" 2>/dev/null); sleep 2
+    rpm2=$(cat "$h/fan${c}_input" 2>/dev/null)
+    printf "  %-6s %-6s %s%s\n" "$v" "$((v*100/255))%" "$rpm" \
+      "$([ "$rpm" != "$rpm2" ] && echo " / $rpm2  <- unstable")"
+    if [[ ${rpm:-0} -eq 0 || ${rpm2:-0} -eq 0 ]]; then stall=$v; break; fi
+  done
+  echo "$old" > "$p"
+  [[ -n ${oldn:-} ]] && echo "$oldn" > "${p}_enable" 2>/dev/null
+  echo
+  if [[ -n $stall ]]; then
+    echo "Fan stalled at PWM $stall."
+    echo "Set the STALL FLOOR for this fan comfortably above it - the last value"
+    echo "that was stable across both samples, plus a little margin."
+  else
+    echo "No stall observed down to PWM 10. A floor of 0 is fine for this fan."
+  fi
+}
+
+restore() {
+  local h p
+  for h in $(find_hwmons); do
+    for p in "$h"/pwm[0-9]_enable; do [[ -w $p ]] && echo 2 > "$p"; done
+  done
+  echo "all channels returned to chip automatic mode"
+}
+
+case "${1:-}" in
+  ""|--list) list ;;
+  --map)     map ;;
+  --sweep)   [[ -n ${2:-} ]] || { echo "usage: fan-detect --sweep <channel>"; exit 1; }; sweep "$2" ;;
+  --restore) restore ;;
+  *) sed -n '3,20p' "$0" | sed 's/^#\s\?//' ;;
+esac

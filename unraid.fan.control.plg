@@ -1,0 +1,74 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+<!ENTITY name      "unraid.fan.control">
+<!ENTITY author    "SeraphimSerapis">
+<!ENTITY version   "2026.08.15">
+<!ENTITY src       "/boot/config/plugins/&name;">
+<!ENTITY dst       "/usr/local/emhttp/plugins/&name;">
+]>
+
+<PLUGIN name="&name;" author="&author;" version="&version;" launch="Settings/FanControl">
+
+<CHANGES>
+###2026.08.15
+- Initial release.
+- Per-fan curves with independent temperature sources.
+- Per-fan stall floor and emergency trip.
+- Silent / Balanced / Cool presets per temperature source.
+- fan-detect helper for mapping channels and measuring stall floors.
+</CHANGES>
+
+<FILE Run="/bin/bash">
+<INLINE>
+<![CDATA[
+mkdir -p &dst;/scripts &dst;/include
+
+for f in FanControl.page; do
+  cp -f &src;/$f &dst;/ 2>/dev/null
+done
+cp -f &src;/scripts/fancontrol    &dst;/scripts/
+cp -f &src;/scripts/rc.fancontrol &dst;/scripts/
+cp -f &src;/scripts/fan-detect    &dst;/scripts/
+cp -f &src;/include/status.php            &dst;/include/
+cp -f &src;/include/update.fancontrol.php &dst;/include/
+cp -f &src;/include/presets.php           &dst;/include/
+chmod +x &dst;/scripts/fancontrol &dst;/scripts/rc.fancontrol &dst;/scripts/fan-detect
+
+ln -sf &dst;/scripts/fan-detect /usr/local/bin/fan-detect 2>/dev/null
+
+[ -f &src;/&name;.cfg ] || cp -f &dst;/&name;.cfg &src;/ 2>/dev/null
+
+if ! ls /sys/class/hwmon/hwmon*/pwm[0-9] >/dev/null 2>&1; then
+  echo ""
+  echo "WARNING: no writable pwm nodes found."
+  echo "This plugin needs a super-I/O driver for your board:"
+  echo "  ITE chips     -> install the 'it87-driver' plugin"
+  echo "  Nuvoton chips -> modprobe nct6775"
+  echo "Run 'fan-detect' after loading one."
+  echo ""
+fi
+
+&dst;/scripts/rc.fancontrol restart
+echo "&name; &version; installed"
+]]>
+</INLINE>
+</FILE>
+
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+<![CDATA[
+&dst;/scripts/rc.fancontrol stop 2>/dev/null
+
+# Hand every channel back to the chip so fans are never left under our control.
+for h in /sys/class/hwmon/hwmon*; do
+  for p in $h/pwm[0-9]_enable; do [ -w "$p" ] && echo 2 > "$p"; done
+done
+
+rm -f /usr/local/bin/fan-detect
+rm -rf &dst;
+echo "&name; removed - fans returned to chip automatic mode"
+]]>
+</INLINE>
+</FILE>
+
+</PLUGIN>

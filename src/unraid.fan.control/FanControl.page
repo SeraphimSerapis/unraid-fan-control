@@ -1,0 +1,227 @@
+Menu="OtherSettings"
+Type="xmenu"
+Title="Fan Control"
+Icon="icon-fan"
+Tag="snowflake-o"
+---
+<?PHP
+/* unraid-fan-control - per-fan curve control.
+ * https://github.com/SeraphimSerapis/unraid-fan-control
+ * MIT licensed.
+ */
+$docroot = $docroot ?? $_SERVER['DOCUMENT_ROOT'] ?: '/usr/local/emhttp';
+$sName = "unraid.fan.control";
+$cfg   = parse_plugin_cfg($sName);
+require_once "$docroot/plugins/$sName/include/presets.php";
+
+function v($cfg,$k,$d='') { return isset($cfg[$k]) && $cfg[$k]!=='' ? $cfg[$k] : $d; }
+
+/* Which channels exist? Prefer what the daemon actually found, fall back to cfg. */
+$state = @parse_ini_file('/var/local/emhttp/unraidfan.ini', true) ?: [];
+$fans  = [];
+foreach ($state as $sec => $vals) if (preg_match('/^fan(\d+)$/',$sec,$m)) $fans[] = $m[1];
+if (!$fans) $fans = array_filter(preg_split('/\s+/', trim(v($cfg,'FANS',''))));
+sort($fans, SORT_NUMERIC);
+
+$chip  = $state['system']['chip'] ?? '';
+$srcs  = ['hdd'=>'Hottest array HDD','ssd'=>'Hottest SSD/NVMe (array & pools)',
+          'nvme'=>'Hottest NVMe (controller)','cpu'=>'CPU package','max'=>'Highest of all'];
+?>
+<style>
+.fanblk    { border-left:3px solid #ff8c2f; padding-left:14px; margin:22px 0 6px 0; }
+.fanblk h3 { margin:0 0 3px 0; font-size:1.15em; }
+.fanlive   { font-family:monospace; opacity:.85; }
+.fanbar    { display:inline-block; width:150px; height:9px; background:rgba(128,128,128,.28);
+             border-radius:5px; overflow:hidden; vertical-align:middle; margin-right:8px; }
+.fanbar>i  { display:block; height:100%; background:#ff8c2f; width:0; transition:width .6s; }
+.fanbar.em>i { background:#e5544b; }
+.warnmsg   { color:#e5544b; font-weight:bold; }
+.fanoff    { opacity:.45; }
+.presetdesc{ opacity:.7; font-style:italic; }
+</style>
+
+<script>
+var FAN_PRESETS = <?=json_encode($fan_presets)?>;
+var FAN_EMERG   = <?=json_encode($fan_emerg)?>;
+
+function applyPreset(n) {
+  var p   = $('#preset'+n).val();
+  var src = $('[name=FAN'+n+'_SOURCE]').val();
+  if (p === 'custom' || !FAN_PRESETS[src] || !FAN_PRESETS[src][p]) { showPresetDesc(n); return; }
+  var d = FAN_PRESETS[src][p];
+  $('[name=FAN'+n+'_TLOW]').val(d.tlow);
+  $('[name=FAN'+n+'_THIGH]').val(d.thigh);
+  $('[name=FAN'+n+'_PMAX]').val(d.pmax);
+  if (FAN_EMERG[src] !== undefined) $('[name=FAN'+n+'_EMERG]').val(FAN_EMERG[src]);
+  showPresetDesc(n); checkFan(n);
+}
+function showPresetDesc(n) {
+  var p = $('#preset'+n).val(), src = $('[name=FAN'+n+'_SOURCE]').val(), t = '';
+  if (p !== 'custom' && FAN_PRESETS[src] && FAN_PRESETS[src][p]) t = FAN_PRESETS[src][p].desc;
+  $('#presetdesc'+n).text(t);
+}
+/* Changing the source invalidates the preset - a CPU curve is meaningless on HDDs. */
+function sourceChanged(n) { $('#preset'+n).val('custom'); showPresetDesc(n); checkFan(n); }
+
+function checkFan(n) {
+  var pmin  = parseInt($('[name=FAN'+n+'_PMIN]').val())  || 0;
+  var pmax  = parseInt($('[name=FAN'+n+'_PMAX]').val())  || 0;
+  var floor = parseInt($('[name=FAN'+n+'_FLOOR]').val()) || 0;
+  var tlow  = parseInt($('[name=FAN'+n+'_TLOW]').val())  || 0;
+  var thigh = parseInt($('[name=FAN'+n+'_THIGH]').val()) || 0;
+  var w = [];
+  if (floor > 0 && pmin < floor) w.push('Minimum PWM is below the stall floor - it will be clamped up to '+floor+'.');
+  if (thigh <= tlow)             w.push('Full-speed temperature must be above the minimum-speed temperature.');
+  if (pmax < pmin)               w.push('Maximum PWM is below minimum PWM.');
+  $('#warn'+n).html(w.join('<br>')).toggle(w.length > 0);
+}
+
+function fanRefresh() {
+  $.getJSON('/plugins/unraid.fan.control/include/status.php', function(d) {
+    if (!d) return;
+    $('#svcstate').html(d.running
+      ? '<span style="color:#4fae4f">&#9679; running</span>'
+      : '<span style="color:#e5544b">&#9679; stopped</span>');
+    if (d.temps) {
+      var bits = [];
+      $.each(d.temps, function(k,v){ if (v !== '') bits.push(k.toUpperCase()+' '+v+'&deg;C'); });
+      $('#alltemps').html(bits.join(' &nbsp;|&nbsp; '));
+    }
+    if (!d.fans) return;
+    $.each(d.fans, function(n,f) {
+      var box = $('#live'+n); if (!box.length) return;
+      if (f.enabled != '1') { box.html('<span class="fanoff">not managed &mdash; chip auto mode</span>'); return; }
+      var pct = parseInt(f.pct||0);
+      box.html('<span class="fanbar'+(f.emergency=='1'?' em':'')+'"><i style="width:'+pct+'%"></i></span>' +
+        '<span class="fanlive">'+f.rpm+' rpm &nbsp; PWM '+f.pwm+' ('+pct+'%)' +
+        (f.temp !== '' ? ' &nbsp; &larr; '+f.source+' '+f.temp+'&deg;C' : '') +
+        (f.emergency=='1' ? ' <b style="color:#e5544b">EMERGENCY</b>' : '')+'</span>');
+    });
+  });
+}
+$(function(){
+  fanRefresh(); setInterval(fanRefresh, 4000);
+  <?php foreach ($fans as $n): ?>showPresetDesc(<?=$n?>); checkFan(<?=$n?>);
+  <?php endforeach; ?>
+});
+</script>
+
+_(Status)_:
+: <span id="svcstate">&nbsp;</span> &nbsp; <span class="fanlive" id="alltemps"></span>
+
+_(Detected controller)_:
+: <span class="fanlive"><?= $chip ? htmlspecialchars($chip) : '<span class="warnmsg">none - is the sensor driver loaded?</span>' ?><?= $fans ? ' &mdash; '.count($fans).' fan channel(s)' : '' ?></span>
+
+<?php if (!$fans): ?>
+> **No fan channels found.** This plugin needs a hardware monitoring driver that
+> exposes writable `pwmN` nodes. On most Unraid boxes that means installing the
+> **it87-driver** plugin (ITE chips) or loading `nct6775` (Nuvoton). See the
+> project README for details.
+<?php endif; ?>
+
+<form markdown="1" name="fanctl" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" name="#file" value="<?=$sName?>/<?=$sName?>.cfg">
+<input type="hidden" name="#include" value="/plugins/<?=$sName?>/include/update.fancontrol.php">
+<input type="hidden" name="FANS" value="<?=htmlspecialchars(implode(' ',$fans))?>">
+
+_(Enable fan control)_:
+: <select name="SERVICE">
+  <?=mk_option(v($cfg,'SERVICE','enable'), "enable",  _("Yes"))?>
+  <?=mk_option(v($cfg,'SERVICE','enable'), "disable", _("No"))?>
+  </select>
+
+_(Poll interval)_:
+: <select name="INTERVAL">
+  <?php foreach ([2,5,10,15,30,60] as $i) echo mk_option(v($cfg,'INTERVAL','5'), "$i", "$i "._("seconds")); ?>
+  </select>
+
+> Keep this short. Drives change temperature over minutes, but a CPU can go from
+> idle to its throttle point in well under 30 seconds &mdash; a slow poll means the
+> fan reacts after the damage to performance is already done. 5 seconds is cheap.
+
+_(Ramp-down hysteresis)_:
+: <select name="HYST">
+  <?php foreach ([0,1,2,3,5] as $i) echo mk_option(v($cfg,'HYST','2'), "$i", "$i &deg;C"); ?>
+  </select>
+
+> Fans speed up immediately, but only slow down once the temperature has dropped
+> this far below the point that set the current speed. Prevents hunting.
+
+<?php foreach ($fans as $n):
+  $src = v($cfg,"FAN{$n}_SOURCE",'hdd');
+?>
+
+<div class="fanblk">
+<h3><?=htmlspecialchars(v($cfg,"FAN{$n}_NAME","Fan $n"))?>
+    &nbsp;<small style="opacity:.6">pwm<?=$n?> / fan<?=$n?></small></h3>
+<div id="live<?=$n?>" class="fanlive">&nbsp;</div>
+</div>
+
+_(Label)_:
+: <input type="text" name="FAN<?=$n?>_NAME" maxlength="30" value="<?=htmlspecialchars(v($cfg,"FAN{$n}_NAME","Fan $n"))?>">
+
+_(Manage this fan)_:
+: <select name="FAN<?=$n?>_ENABLED">
+  <?=mk_option(v($cfg,"FAN{$n}_ENABLED","1"), "1", _("Yes"))?>
+  <?=mk_option(v($cfg,"FAN{$n}_ENABLED","1"), "0", _("No - leave on chip auto"))?>
+  </select>
+
+_(Temperature source)_:
+: <select name="FAN<?=$n?>_SOURCE" onchange="sourceChanged(<?=$n?>)">
+  <?php foreach ($srcs as $k=>$lbl) echo mk_option($src, $k, _($lbl)); ?>
+  </select>
+
+_(Preset)_:
+: <select id="preset<?=$n?>" onchange="applyPreset(<?=$n?>)">
+  <option value="custom"><?=_("Custom")?></option>
+  <option value="silent"><?=_("Silent")?></option>
+  <option value="balanced"><?=_("Balanced")?></option>
+  <option value="cool"><?=_("Cool")?></option>
+  </select>
+  <div id="presetdesc<?=$n?>" class="presetdesc"></div>
+
+> Presets fill in the curve below for the selected temperature source. They never
+> touch minimum PWM or the stall floor &mdash; those describe your physical fan and
+> are found by measurement, so they survive a preset change.
+
+_(Curve)_:
+: <input type="number" name="FAN<?=$n?>_TLOW" min="0" max="99" style="width:6em" onchange="checkFan(<?=$n?>)"
+    value="<?=htmlspecialchars(v($cfg,"FAN{$n}_TLOW","38"))?>"> &deg;C at minimum speed
+  &nbsp;&rarr;&nbsp;
+  <input type="number" name="FAN<?=$n?>_THIGH" min="1" max="110" style="width:6em" onchange="checkFan(<?=$n?>)"
+    value="<?=htmlspecialchars(v($cfg,"FAN{$n}_THIGH","50"))?>"> &deg;C at full speed
+
+_(PWM range)_:
+: <input type="number" name="FAN<?=$n?>_PMIN" min="0" max="255" style="width:6em" onchange="checkFan(<?=$n?>)"
+    value="<?=htmlspecialchars(v($cfg,"FAN{$n}_PMIN","45"))?>"> min
+  &nbsp;&rarr;&nbsp;
+  <input type="number" name="FAN<?=$n?>_PMAX" min="1" max="255" style="width:6em" onchange="checkFan(<?=$n?>)"
+    value="<?=htmlspecialchars(v($cfg,"FAN{$n}_PMAX","255"))?>"> max &nbsp;<small style="opacity:.6">(0-255)</small>
+
+_(Stall floor)_:
+: <input type="number" name="FAN<?=$n?>_FLOOR" min="0" max="255" style="width:6em" onchange="checkFan(<?=$n?>)"
+    value="<?=htmlspecialchars(v($cfg,"FAN{$n}_FLOOR","0"))?>">
+
+> Hard clamp: this fan is never driven below this PWM, whatever the curve says.
+> Many fans stop entirely below some duty and then judder trying to restart,
+> reporting 0 rpm. Find yours with `fan-detect --sweep <?=$n?>` and set this to the
+> lowest duty that spins reliably. `0` disables the clamp.
+
+_(Emergency trip)_:
+: <input type="number" name="FAN<?=$n?>_EMERG" min="0" max="120" style="width:6em"
+    value="<?=htmlspecialchars(v($cfg,"FAN{$n}_EMERG","0"))?>"> &deg;C
+
+> Above this temperature the curve and the ramp-down hysteresis are both bypassed
+> and this fan goes straight to maximum. Backstop for load steps faster than the
+> poll interval. `0` disables it.
+
+<div id="warn<?=$n?>" class="warnmsg" style="display:none"></div>
+
+<?php endforeach; ?>
+
+&nbsp;
+: <input type="submit" name="#default" value="_(Default)_">
+  <input type="submit" value="_(Apply)_">
+  <input type="button" value="_(Done)_" onclick="done()">
+
+</form>

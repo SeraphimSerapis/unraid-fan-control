@@ -1,0 +1,281 @@
+#!/bin/bash
+#=======================================================================================
+#  unraid-fan-control - fan control daemon
+#
+#  Drives an arbitrary set of hwmon PWM channels, each with its own temperature
+#  source, its own linear curve, its own stall floor and its own emergency trip.
+#
+#  Design notes that matter:
+#
+#  * POLL RATE. Hard drives have thermal mass measured in minutes; a 30s poll is
+#    plenty. A low-power CPU can go from idle to TjMax in under 30 seconds. This
+#    was measured on a DXP6800: with a 30s poll the i5-1235U hit 100C (throttling)
+#    while the fan was still idling at 313 rpm. The daemon therefore ticks fast
+#    (default 5s) for every fan, and relies on hysteresis - not slow polling - to
+#    keep fans from hunting.
+#
+#  * STALL FLOORS. Some fans stop entirely below a certain duty and then judder
+#    trying to restart, reporting 0 rpm. On the DXP6800 the CPU blower stalls
+#    below PWM 20 and is erratic at 25. A per-fan hard clamp is not a preference,
+#    it is a safety requirement, so it is applied last and cannot be overridden
+#    by a curve.
+#
+#  * EMERGENCY TRIP. Above a per-fan emergency temperature the curve and the
+#    ramp-down hysteresis are both bypassed and the fan goes to maximum. This is
+#    the backstop for load steps faster than the poll interval.
+#=======================================================================================
+program=fancontrol
+PLUGIN=unraid.fan.control
+CFG=/boot/config/plugins/$PLUGIN/$PLUGIN.cfg
+STATE=/var/local/emhttp/unraidfan.ini
+LOCK=/var/run/$PLUGIN.pid
+
+log() { logger -t unraid-fan "$1"; }
+
+#---------------------------------------------------------------------------------------
+# Config
+#---------------------------------------------------------------------------------------
+load_cfg() {
+  SERVICE="enable"; INTERVAL=5; HYST=2; FANS=""; CHIP=""
+  [[ -r $CFG ]] && source <(grep -E '^[A-Za-z0-9_]+=' "$CFG")
+  INTERVAL=${INTERVAL:-5}; (( INTERVAL < 1 )) && INTERVAL=1
+  HYST=${HYST:-2}
+}
+
+cfgval() { local v="FAN${1}_${2}"; echo "${!v:-$3}"; }
+
+#---------------------------------------------------------------------------------------
+# Hardware discovery
+#
+# Not tied to any particular super-I/O chip. Any hwmon device exposing writable
+# pwmN nodes will do - IT87 (ITE), NCT6775 (Nuvoton), etc. CHIP pins a specific
+# hwmon name when a board has more than one candidate.
+#---------------------------------------------------------------------------------------
+find_hwmon() {
+  local h n
+  for h in /sys/class/hwmon/hwmon*; do
+    n=$(cat "$h/name" 2>/dev/null) || continue
+    [[ -n $CHIP && $n != "$CHIP" ]] && continue
+    compgen -G "$h/pwm[0-9]" >/dev/null 2>&1 && { echo "$h"; return 0; }
+  done
+  return 1
+}
+
+# Channels that have BOTH a writable pwm and a tach, i.e. real, connected fans.
+discover_fans() {
+  local hw=$1 p n out=""
+  for p in "$hw"/pwm[0-9]; do
+    [[ -w $p ]] || continue
+    n=${p##*/pwm}
+    [[ -r $hw/fan${n}_input ]] && out+="$n "
+  done
+  echo "${out% }"
+}
+
+#---------------------------------------------------------------------------------------
+# Temperature sources
+#---------------------------------------------------------------------------------------
+DISKS_INI=/var/local/emhttp/disks.ini
+
+# Hottest spinning ARRAY HDD, read from Unraid's own disks.ini so that spun-down
+# drives are never woken just to be polled. Empty if nothing is readable.
+temp_hdd() {
+  [[ -r $DISKS_INI ]] || return
+  awk -F'"' '
+    function flush() { if (rot=="1" && t ~ /^[0-9]+$/ && t+0>max) max=t+0; rot=""; t="" }
+    /^\[/          { flush() }
+    /^rotational=/ { rot=$2 }
+    /^temp=/       { t=$2 }
+    END            { flush(); if (max>0) print max }
+  ' "$DISKS_INI"
+}
+
+# Hottest SSD/NVMe in the array or pools, also from disks.ini (rotational="0").
+temp_ssd() {
+  [[ -r $DISKS_INI ]] || return
+  awk -F'"' '
+    function flush() { if (rot=="0" && t ~ /^[0-9]+$/ && t+0>max) max=t+0; rot=""; t="" }
+    /^\[/          { flush() }
+    /^rotational=/ { rot=$2 }
+    /^temp=/       { t=$2 }
+    END            { flush(); if (max>0) print max }
+  ' "$DISKS_INI"
+}
+
+temp_nvme() {
+  local max=0 v h
+  for h in /sys/class/hwmon/hwmon*; do
+    [[ $(cat "$h/name" 2>/dev/null) == nvme ]] || continue
+    v=$(cat "$h/temp1_input" 2>/dev/null) || continue
+    v=$((v/1000)); (( v > max )) && max=$v
+  done
+  (( max > 0 )) && echo $max
+}
+
+temp_cpu() {
+  local h v
+  for h in /sys/class/hwmon/hwmon*; do
+    case "$(cat "$h/name" 2>/dev/null)" in
+      coretemp|k10temp|zenpower)
+        v=$(cat "$h/temp1_input" 2>/dev/null) || continue
+        echo $((v/1000)); return ;;
+    esac
+  done
+}
+
+get_temp() {
+  case $1 in
+    cpu)  temp_cpu ;;
+    nvme) temp_nvme ;;
+    ssd)  temp_ssd ;;
+    hdd)  temp_hdd ;;
+    max)  { temp_hdd; temp_nvme; temp_cpu; } | sort -rn | head -1 ;;
+  esac
+}
+
+#---------------------------------------------------------------------------------------
+# Curve
+#---------------------------------------------------------------------------------------
+calc_pwm() { # temp low high pmin pmax
+  local t=$1 lo=$2 hi=$3 pmin=$4 pmax=$5
+  (( hi <= lo )) && { echo "$pmax"; return; }
+  if   (( t <= lo )); then echo "$pmin"
+  elif (( t >= hi )); then echo "$pmax"
+  else echo $(( pmin + ((t-lo)*(pmax-pmin))/(hi-lo) ))
+  fi
+}
+
+#=======================================================================================
+# Main
+#=======================================================================================
+if [[ $1 == -q ]]; then
+  if [[ -f $LOCK ]]; then
+    pid=$(cat "$LOCK"); kill "$pid" 2>/dev/null && log "stopped (pid $pid)"
+    rm -f "$LOCK" "$STATE"
+  fi
+  exit 0
+fi
+
+if [[ -f $LOCK ]] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+  exit 0
+fi
+
+load_cfg
+[[ $SERVICE != enable ]] && { rm -f "$STATE"; exit 0; }
+
+(
+echo $BASHPID > "$LOCK"
+trap 'rm -f "$LOCK" "$STATE"' EXIT
+
+declare -A applied_pwm applied_temp
+started=0
+
+while [[ -f $LOCK ]]; do
+  load_cfg
+  [[ $SERVICE != enable ]] && break
+
+  HW=$(find_hwmon)
+  if [[ -z $HW ]]; then
+    sleep "$INTERVAL"; continue          # driver not loaded yet (early boot)
+  fi
+
+  # Fall back to whatever the hardware actually exposes.
+  active_fans=${FANS:-$(discover_fans "$HW")}
+
+  if (( started == 0 )); then
+    # Clear bogus BIOS fan minimums. Some boards ship nonsense values (the
+    # DXP6800 sets fan4_min to 675000 rpm) which makes `sensors` report a
+    # permanent false ALARM.
+    for f in "$HW"/fan*_min; do [[ -w $f ]] && echo 0 > "$f"; done
+    log "started - chip $(cat "$HW/name") fans: $active_fans (tick ${INTERVAL}s)"
+    started=1
+  fi
+
+  {
+    echo "[system]"
+    echo "hwmon=\"${HW##*/}\""
+    echo "chip=\"$(cat "$HW/name" 2>/dev/null)\""
+    echo "updated=\"$(date +%s)\""
+    for s in cpu hdd ssd nvme; do echo "temp_${s}=\"$(get_temp $s)\""; done
+  } > "$STATE.tmp"
+
+  for n in $active_fans; do
+    en=$(cfgval "$n" ENABLED 1)
+    name=$(cfgval "$n" NAME "Fan $n")
+    src=$(cfgval "$n" SOURCE hdd)
+    tlow=$(cfgval "$n" TLOW 38)
+    thigh=$(cfgval "$n" THIGH 50)
+    pmin=$(cfgval "$n" PMIN 45)
+    pmax=$(cfgval "$n" PMAX 255)
+    floor=$(cfgval "$n" FLOOR 0)
+    emerg=$(cfgval "$n" EMERG 0)
+
+    pwmf="$HW/pwm$n"; fanf="$HW/fan${n}_input"
+    [[ -w $pwmf ]] || continue
+
+    rpm=$(cat "$fanf" 2>/dev/null); rpm=${rpm:-0}
+
+    if [[ $en != 1 ]]; then
+      [[ $(cat "${pwmf}_enable" 2>/dev/null) == 2 ]] || echo 2 > "${pwmf}_enable" 2>/dev/null
+      { echo "[fan$n]"; echo "name=\"$name\""; echo "enabled=\"0\""
+        echo "rpm=\"$rpm\""; echo "pwm=\"$(cat "$pwmf" 2>/dev/null)\""
+        echo "source=\"\""; echo "temp=\"\""; } >> "$STATE.tmp"
+      continue
+    fi
+
+    t=$(get_temp "$src")
+    emergency=0
+    if [[ -z $t ]]; then
+      # Never coast on a missing reading - hold a safe mid duty.
+      target=$(( pmax*55/100 )); reason="no ${src} reading - fail-safe"
+    else
+      target=$(calc_pwm "$t" "$tlow" "$thigh" "$pmin" "$pmax"); reason="${src} ${t}C"
+      if (( emerg > 0 && t >= emerg )); then
+        target=$pmax; emergency=1; reason="${src} ${t}C EMERGENCY"
+      fi
+    fi
+
+    prev=${applied_pwm[$n]:--1}
+    ptemp=${applied_temp[$n]:--1}
+
+    # Ramp up at once; ramp down only after HYST degrees of genuine cooling.
+    # Emergency bypasses hysteresis in both directions.
+    if (( emergency == 0 )) && (( target < prev )) && [[ -n $t ]] \
+       && (( ptemp >= 0 )) && (( ptemp - t < HYST )); then
+      target=$prev
+    fi
+
+    # Stall floor is applied LAST so nothing can drive the fan into a stall.
+    (( floor > 0 && target < floor )) && target=$floor
+
+    if (( target != prev )); then
+      [[ $(cat "${pwmf}_enable" 2>/dev/null) == 1 ]] || echo 1 > "${pwmf}_enable" 2>/dev/null
+      echo "$target" > "$pwmf" 2>/dev/null
+      log "$name: $reason -> pwm $prev to $target ($(( target*100/255 ))%)"
+      applied_pwm[$n]=$target
+      [[ -n $t ]] && applied_temp[$n]=$t
+      rpm=$(cat "$fanf" 2>/dev/null); rpm=${rpm:-0}
+    else
+      # Re-assert: some chips silently revert a channel to their own auto curve.
+      [[ $(cat "${pwmf}_enable" 2>/dev/null) == 1 ]] || echo 1 > "${pwmf}_enable" 2>/dev/null
+      echo "$target" > "$pwmf" 2>/dev/null
+    fi
+
+    { echo "[fan$n]"; echo "name=\"$name\""; echo "enabled=\"1\""
+      echo "rpm=\"$rpm\""; echo "pwm=\"$target\""; echo "pct=\"$(( target*100/255 ))\""
+      echo "emergency=\"$emergency\""
+      echo "source=\"$src\""; echo "temp=\"$t\""
+      echo "tlow=\"$tlow\""; echo "thigh=\"$thigh\""
+      echo "pmin=\"$pmin\""; echo "pmax=\"$pmax\""
+      echo "floor=\"$floor\""; echo "emerg=\"$emerg\""; } >> "$STATE.tmp"
+  done
+
+  mv -f "$STATE.tmp" "$STATE" 2>/dev/null
+  sleep "$INTERVAL"
+done
+
+rm -f "$LOCK" "$STATE"
+) &
+
+disown
+exit 0

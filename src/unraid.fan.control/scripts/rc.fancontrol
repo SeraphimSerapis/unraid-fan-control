@@ -1,0 +1,20 @@
+#!/bin/bash
+# unraid.fan.control - start/stop wrapper
+DAEMON=/usr/local/emhttp/plugins/unraid.fan.control/scripts/fancontrol
+LOCK=/var/run/unraid.fan.control.pid
+
+# Output is detached from the caller. The daemon forks and exits, but the forked
+# child inherits stdout/stderr - if those are a pipe (PHP exec() from the webGui),
+# the caller blocks until the daemon dies. Redirecting keeps Apply responsive.
+case "$1" in
+  start)   $DAEMON        >/dev/null 2>&1 ;;
+  stop)    $DAEMON -q     >/dev/null 2>&1 ;;
+  restart) $DAEMON -q     >/dev/null 2>&1; sleep 1; $DAEMON >/dev/null 2>&1 ;;
+  status)
+    if [[ -f $LOCK ]] && kill -0 "$(cat $LOCK 2>/dev/null)" 2>/dev/null; then
+      echo "running ($(cat $LOCK))"; exit 0
+    else
+      echo "stopped"; exit 1
+    fi ;;
+  *) echo "usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac
