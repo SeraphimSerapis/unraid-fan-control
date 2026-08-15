@@ -16,6 +16,20 @@ require_once "$docroot/plugins/$sName/include/presets.php";
 
 function v($cfg,$k,$d='') { return isset($cfg[$k]) && $cfg[$k]!=='' ? $cfg[$k] : $d; }
 
+/* Which preset, if any, do this fan's current values correspond to? The preset
+ * is not stored in the config - the curve values are the truth - so it is
+ * derived. Otherwise a fan sitting on stock settings would report "Custom",
+ * which tells the user nothing and invites a pointless re-Apply. */
+function detect_preset($cfg, $n, $src, $presets) {
+  if (!isset($presets[$src])) return 'custom';
+  foreach ($presets[$src] as $name => $p) {
+    if ((int)v($cfg,"FAN{$n}_TLOW",-1)  === $p['tlow']
+     && (int)v($cfg,"FAN{$n}_THIGH",-1) === $p['thigh']
+     && (int)v($cfg,"FAN{$n}_PMAX",-1)  === $p['pmax']) return $name;
+  }
+  return 'custom';
+}
+
 /* Which channels exist? Prefer what the daemon actually found, fall back to cfg. */
 $state = @parse_ini_file('/var/local/emhttp/unraidfan.ini', true) ?: [];
 $fans  = [];
@@ -63,7 +77,23 @@ function showPresetDesc(n) {
 /* Changing the source invalidates the preset - a CPU curve is meaningless on HDDs. */
 function sourceChanged(n) { $('#preset'+n).val('custom'); showPresetDesc(n); checkFan(n); }
 
+/* Keep the dropdown honest: if hand-edited values happen to match a preset, say
+ * so; if they no longer match, say Custom. The curve is the truth, not the label. */
+function reconcilePreset(n) {
+  var src = $('[name=FAN'+n+'_SOURCE]').val();
+  var tl = parseInt($('[name=FAN'+n+'_TLOW]').val());
+  var th = parseInt($('[name=FAN'+n+'_THIGH]').val());
+  var pm = parseInt($('[name=FAN'+n+'_PMAX]').val());
+  var found = 'custom';
+  if (FAN_PRESETS[src]) $.each(FAN_PRESETS[src], function(name,p) {
+    if (p.tlow === tl && p.thigh === th && p.pmax === pm) { found = name; return false; }
+  });
+  $('#preset'+n).val(found);
+  showPresetDesc(n);
+}
+
 function checkFan(n) {
+  reconcilePreset(n);
   var pmin  = parseInt($('[name=FAN'+n+'_PMIN]').val())  || 0;
   var pmax  = parseInt($('[name=FAN'+n+'_PMAX]').val())  || 0;
   var floor = parseInt($('[name=FAN'+n+'_FLOOR]').val()) || 0;
@@ -173,10 +203,9 @@ _(Temperature source)_:
 
 _(Preset)_:
 : <select id="preset<?=$n?>" onchange="applyPreset(<?=$n?>)">
-  <option value="custom"><?=_("Custom")?></option>
-  <option value="silent"><?=_("Silent")?></option>
-  <option value="balanced"><?=_("Balanced")?></option>
-  <option value="cool"><?=_("Cool")?></option>
+  <?php $cp = detect_preset($cfg,$n,$src,$fan_presets);
+        foreach (['custom'=>'Custom','silent'=>'Silent','balanced'=>'Balanced','cool'=>'Cool'] as $k=>$lbl)
+          printf('<option value="%s"%s>%s</option>', $k, $k===$cp?' selected':'', _($lbl)); ?>
   </select>
   <div id="presetdesc<?=$n?>" class="presetdesc"></div>
 
