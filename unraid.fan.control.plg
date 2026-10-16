@@ -2,8 +2,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "unraid.fan.control">
 <!ENTITY author    "SeraphimSerapis">
-<!ENTITY version   "2026.08.24">
-<!ENTITY sha       "385ea2d5034fee43e672e7c0015e59b4e0b8d17d">
+<!ENTITY version   "2026.10.16">
+<!ENTITY sha       "7d3f2ef4645926f9a1c4c9758c1897dd1fc75266">
 <!ENTITY repo      "https://raw.githubusercontent.com/SeraphimSerapis/unraid-fan-control/&sha;/src/&name;">
 <!ENTITY src       "/boot/config/plugins/&name;">
 <!ENTITY dst       "/usr/local/emhttp/plugins/&name;">
@@ -12,6 +12,14 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="Settings/FanControl">
 
 <CHANGES>
+###2026.10.16
+- HDD-sourced fans idle at their curve minimum when every HDD is spun down. Unraid
+  reports no temperature for a sleeping drive, which the daemon treated as a
+  failed sensor and answered with its 55% fail-safe duty.
+- Fix updates never reaching an installed system: cached payload files on flash
+  were reused forever, whatever commit the plg pinned. The cache is now keyed to
+  the pinned commit. Downloads land in a temporary file first, so a failed fetch
+  no longer leaves a truncated file behind.
 ###2026.08.24
 - Fix install failure: plg previously assumed payload files were already present in
   /boot/config/plugins/unraid.fan.control/ - with nothing there every cp failed and
@@ -33,24 +41,31 @@
 # so all ampersands must be written as &amp; (see appdata.backup.plg for precedent).
 fetch() {
   local rel="$1" out="&src;/$1"
-  [ -s "$out" ] &amp;&amp; return 0            # already cached on flash
+  [ -s "$out" ] &amp;&amp; [ "$cached" = "&sha;" ] &amp;&amp; return 0   # cached for this commit
   mkdir -p "$(dirname "$out")"
-  curl -fsSL --max-time 60 --retry 2 "&repo;/$rel" -o "$out" || {
+  if ! curl -fsSL --max-time 60 --retry 2 "&repo;/$rel" -o "$out.part"; then
+    rm -f "$out.part"
     echo "ERROR: failed to download $rel"
     return 1
-  }
+  fi
+  mv -f "$out.part" "$out"
 }
 
 mkdir -p &src; &dst;/scripts &dst;/include
+cached=$(cat &src;/.payload-sha 2>/dev/null)
+
+# The shipped default config has the same name as the live user config, so it is
+# only fetched to seed a fresh install. An update must never overwrite settings.
+[ -f &src;/&name;.cfg ] || fetch &name;.cfg || exit 1
 
 fetch FanControl.page                 || exit 1
-fetch unraid.fan.control.cfg          || exit 1
 fetch scripts/fancontrol              || exit 1
 fetch scripts/rc.fancontrol           || exit 1
 fetch scripts/fan-detect              || exit 1
 fetch include/status.php              || exit 1
 fetch include/update.fancontrol.php   || exit 1
 fetch include/presets.php             || exit 1
+echo "&sha;" > &src;/.payload-sha
 
 # ---- stage into emhttp ----
 mkdir -p &dst;/scripts &dst;/include
@@ -64,9 +79,6 @@ cp -f &src;/include/presets.php           &dst;/include/
 chmod +x &dst;/scripts/fancontrol &dst;/scripts/rc.fancontrol &dst;/scripts/fan-detect
 
 ln -sf &dst;/scripts/fan-detect /usr/local/bin/fan-detect 2>/dev/null
-
-# seed user config on flash once; never overwrite an existing one
-[ -f &src;/&name;.cfg ] || cp -f &src;/unraid.fan.control.cfg &src;/&name;.cfg
 
 if ! ls /sys/class/hwmon/hwmon*/pwm[0-9] >/dev/null 2&gt;&amp;1; then
   echo ""
