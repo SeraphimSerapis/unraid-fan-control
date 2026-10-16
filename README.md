@@ -47,7 +47,9 @@ the same drives settled at **44 °C** with no additional noise at idle.
 - **Presets** — Silent / Balanced / Cool per temperature source, with the
   reasoning documented rather than hand-waved.
 - **Never wakes disks** — HDD temperatures come from Unraid's own `disks.ini`, so
-  spun-down drives are never spun up just to be polled.
+  spun-down drives are never spun up just to be polled. When every HDD is spun
+  down, HDD-sourced fans idle at their curve minimum rather than the fail-safe
+  duty used for a missing reading.
 - **`fan-detect` helper** — maps PWM channels to physical fans and measures each
   fan's stall floor, so you can configure hardware nobody has tested.
 

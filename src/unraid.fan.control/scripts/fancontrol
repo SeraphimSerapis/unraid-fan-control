@@ -90,6 +90,20 @@ temp_hdd() {
   ' "$DISKS_INI"
 }
 
+# True when at least one HDD is present and every HDD is spun down. Unraid reports
+# temp="*" for a sleeping drive, so temp_hdd comes back empty; that means idle
+# drives making no heat, not a failed sensor.
+hdd_all_spundown() {
+  [[ -r $DISKS_INI ]] || return 1
+  awk -F'"' '
+    function flush() { if (rot=="1") { n++; if (sd!="1") awake++ }; rot=""; sd="" }
+    /^\[/          { flush() }
+    /^rotational=/ { rot=$2 }
+    /^spundown=/   { sd=$2 }
+    END            { flush(); exit !(n>0 && awake==0) }
+  ' "$DISKS_INI"
+}
+
 # Hottest SSD/NVMe in the array or pools, also from disks.ini (rotational="0").
 temp_ssd() {
   [[ -r $DISKS_INI ]] || return
@@ -225,7 +239,9 @@ while [[ -f $LOCK ]]; do
 
     t=$(get_temp "$src")
     emergency=0
-    if [[ -z $t ]]; then
+    if [[ -z $t && $src == hdd ]] && hdd_all_spundown; then
+      target=$pmin; reason="all hdd spun down"
+    elif [[ -z $t ]]; then
       # Never coast on a missing reading - hold a safe mid duty.
       target=$(( pmax*55/100 )); reason="no ${src} reading - fail-safe"
     else
