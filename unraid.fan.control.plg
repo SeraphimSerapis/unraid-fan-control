@@ -2,7 +2,9 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "unraid.fan.control">
 <!ENTITY author    "SeraphimSerapis">
-<!ENTITY version   "2026.08.15">
+<!ENTITY version   "2026.08.24">
+<!ENTITY sha       "385ea2d5034fee43e672e7c0015e59b4e0b8d17d">
+<!ENTITY repo      "https://raw.githubusercontent.com/SeraphimSerapis/unraid-fan-control/&sha;/src/&name;">
 <!ENTITY src       "/boot/config/plugins/&name;">
 <!ENTITY dst       "/usr/local/emhttp/plugins/&name;">
 ]>
@@ -10,6 +12,12 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="Settings/FanControl">
 
 <CHANGES>
+###2026.08.24
+- Fix install failure: plg previously assumed payload files were already present in
+  /boot/config/plugins/unraid.fan.control/ - with nothing there every cp failed and
+  'rc.fancontrol restart' exited non-zero, so emhttp quarantined the plugin to
+  plugins-error. The installer now fetches the payload from GitHub (pinned to a
+  commit) and caches it on the flash drive.
 ###2026.08.15
 - Initial release.
 - Per-fan curves with independent temperature sources.
@@ -18,14 +26,35 @@
 - fan-detect helper for mapping channels and measuring stall floors.
 </CHANGES>
 
-<FILE Run="/bin/bash">
+<FILE Run="/bin/bash" Method="install">
 <INLINE>
-<![CDATA[
-mkdir -p &dst;/scripts &dst;/include
+# ---- fetch payload from GitHub (pinned commit), cache on flash ----
+# NOTE: no CDATA here - emhttp does not expand entities inside CDATA blocks,
+# so all ampersands must be written as &amp; (see appdata.backup.plg for precedent).
+fetch() {
+  local rel="$1" out="&src;/$1"
+  [ -s "$out" ] &amp;&amp; return 0            # already cached on flash
+  mkdir -p "$(dirname "$out")"
+  curl -fsSL --max-time 60 --retry 2 "&repo;/$rel" -o "$out" || {
+    echo "ERROR: failed to download $rel"
+    return 1
+  }
+}
 
-for f in FanControl.page; do
-  cp -f &src;/$f &dst;/ 2>/dev/null
-done
+mkdir -p &src; &dst;/scripts &dst;/include
+
+fetch FanControl.page                 || exit 1
+fetch unraid.fan.control.cfg          || exit 1
+fetch scripts/fancontrol              || exit 1
+fetch scripts/rc.fancontrol           || exit 1
+fetch scripts/fan-detect              || exit 1
+fetch include/status.php              || exit 1
+fetch include/update.fancontrol.php   || exit 1
+fetch include/presets.php             || exit 1
+
+# ---- stage into emhttp ----
+mkdir -p &dst;/scripts &dst;/include
+cp -f &src;/FanControl.page &dst;/
 cp -f &src;/scripts/fancontrol    &dst;/scripts/
 cp -f &src;/scripts/rc.fancontrol &dst;/scripts/
 cp -f &src;/scripts/fan-detect    &dst;/scripts/
@@ -36,9 +65,10 @@ chmod +x &dst;/scripts/fancontrol &dst;/scripts/rc.fancontrol &dst;/scripts/fan-
 
 ln -sf &dst;/scripts/fan-detect /usr/local/bin/fan-detect 2>/dev/null
 
-[ -f &src;/&name;.cfg ] || cp -f &dst;/&name;.cfg &src;/ 2>/dev/null
+# seed user config on flash once; never overwrite an existing one
+[ -f &src;/&name;.cfg ] || cp -f &src;/unraid.fan.control.cfg &src;/&name;.cfg
 
-if ! ls /sys/class/hwmon/hwmon*/pwm[0-9] >/dev/null 2>&1; then
+if ! ls /sys/class/hwmon/hwmon*/pwm[0-9] >/dev/null 2&gt;&amp;1; then
   echo ""
   echo "WARNING: no writable pwm nodes found."
   echo "This plugin needs a super-I/O driver for your board:"
@@ -50,24 +80,21 @@ fi
 
 &dst;/scripts/rc.fancontrol restart
 echo "&name; &version; installed"
-]]>
 </INLINE>
 </FILE>
 
 <FILE Run="/bin/bash" Method="remove">
 <INLINE>
-<![CDATA[
 &dst;/scripts/rc.fancontrol stop 2>/dev/null
 
 # Hand every channel back to the chip so fans are never left under our control.
 for h in /sys/class/hwmon/hwmon*; do
-  for p in $h/pwm[0-9]_enable; do [ -w "$p" ] && echo 2 > "$p"; done
+  for p in $h/pwm[0-9]_enable; do [ -w "$p" ] &amp;&amp; echo 2 > "$p"; done
 done
 
 rm -f /usr/local/bin/fan-detect
 rm -rf &dst;
 echo "&name; removed - fans returned to chip automatic mode"
-]]>
 </INLINE>
 </FILE>
 
